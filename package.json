@@ -1,0 +1,22 @@
+{
+  "name": "df-sync",
+  "version": "0.1.0",
+  "description": "ローカルの Dataform プロジェクトを GCP Dataform Workspace にミラー同期する（コミットなし）",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "df-sync": "./bin/df-sync.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "google-auth-library": "^10.6.2",
+    "ignore": "^7.0.5"
+  }
+}
