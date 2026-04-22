@@ -29,7 +29,7 @@ export function localSide(root, { listFilter = null, shouldSkipDelete = null } =
     shouldSkipDelete,
     shouldSkipWrite: matchesAlwaysExclude,
     // options.shouldSkipDescent は受けるが使わない: local 列挙は安価で、enumerateLocal が ALWAYS_EXCLUDE を walk 時に枝刈りしている
-    async list() {
+    async list(_options) {
       return enumerateLocal(root, listFilter)
     },
     async read(relPath) {

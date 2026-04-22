@@ -78,10 +78,9 @@ async function resolveLocalDir(dir) {
 }
 
 async function resolveProjectAndLocation(opts, localDir) {
-  if (opts.project && opts.location) {
-    return { project: opts.project, location: opts.location }
-  }
-  const credentials = await readCredentials(localDir)
+  // 両方揃っていれば .df-credentials.json を開かない (不要な I/O 回避)。
+  const credentials =
+    opts.project && opts.location ? null : await readCredentials(localDir)
   const project = opts.project ?? credentials?.projectId
   if (!project) {
     throw new Error(`--project が未指定で ${CREDENTIALS_FILENAME} からも解決できませんでした`)

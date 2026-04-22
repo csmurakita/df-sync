@@ -8,7 +8,7 @@ const API_ROOT = 'https://dataform.googleapis.com/v1'
 // ハングを防ぐため 60s で打ち切る。
 const REQUEST_TIMEOUT_MS = 60_000
 // 5xx / 429 / ネットワークエラーのみ指数バックオフでリトライする。
-// 書き込み系 (writeFile / removeFile / removeDirectory / makeDirectory) は idempotent。
+// 書き込み系 (writeFile / removeFile / removeDirectory) は idempotent。
 const MAX_RETRIES = 3
 const BACKOFF_BASE_MS = 500
 
@@ -31,10 +31,6 @@ export class DataformClient {
 
   async removeDirectory(path) {
     return this.#post(':removeDirectory', { path })
-  }
-
-  async makeDirectory(path) {
-    return this.#post(':makeDirectory', { path })
   }
 
   // shouldSkipDescent(dirPath) が true を返したディレクトリには再帰しない (dir 自体は dirs に残す)。
@@ -178,9 +174,11 @@ function isRetriable(err) {
 function retryDelayMs(err, attempt) {
   const fromHeader = err instanceof HttpRequestError ? err.retryAfter : null
   if (fromHeader != null) return fromHeader
-  // 指数バックオフ + 軽い jitter (フルジッタ)。
+  // 指数バックオフ + jitter。最小待機を BACKOFF_BASE_MS / 2 で下限クランプし、
+  // 5xx/429 のリトライが実質 0ms でサーバを追撃しないようにする。
   const exp = BACKOFF_BASE_MS * 2 ** attempt
-  return Math.floor(Math.random() * exp)
+  const floor = BACKOFF_BASE_MS / 2
+  return Math.floor(floor + Math.random() * (exp - floor))
 }
 
 function parseRetryAfter(value) {
