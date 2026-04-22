@@ -13,7 +13,8 @@ import { runWithLimit } from './concurrency.js'
  *
  * @typedef {Object} Side
  * @property {boolean} supportsRecursiveDirDelete - true なら removeDirectory が再帰的に削除する
- * @property {SkipPredicate | null} shouldSkipDelete - --mirror 削除時にスキップ判定する述語 (任意)
+ * @property {SkipPredicate | null} shouldSkipDelete - --mirror 削除時にスキップ判定する述語 (任意、download 側 destination でのみ使用)
+ * @property {((relPath: string) => boolean) | null} shouldSkipWrite - 書き込み計画から除外するパス判定 (任意、destination=local が ALWAYS_EXCLUDE を弾くために使う)
  * @property {() => Promise<Listing>} list
  * @property {(relPath: string) => Promise<Buffer>} read
  * @property {(relPath: string, bytes: Buffer) => Promise<unknown>} write
@@ -65,7 +66,10 @@ function defaultLog(...args) {
 }
 
 async function selectFilesToWrite(source, destination, src, dst) {
-  const entries = [...src.files]
+  // destination が拒否するパス (download 側 local の ALWAYS_EXCLUDE 等) は
+  // classify する前に落とす — 余計な source.read / destination.read を発行しない。
+  const skipWrite = destination.shouldSkipWrite
+  const entries = skipWrite ? [...src.files].filter(([p]) => !skipWrite(p)) : [...src.files]
   const classified = await runWithLimit(
     entries,
     CLASSIFY_CONCURRENCY,
@@ -98,8 +102,10 @@ async function classify(source, destination, relPath, srcMeta, dstMeta) {
 // mirror が false なら削除対象は空。
 // recursiveDirDelete が true なら dst のディレクトリを rmdir 一括削除できる (remote 向け)。
 // false の場合は列挙済みファイルのみ個別削除する (local 向け)。
-// shouldSkipDelete で守られたパスは削除候補から外す
-// (ローカルの .gitignore / ALWAYS_EXCLUDE 対象を両方向のミラー削除から保護する用途)。
+// shouldSkipDelete が指定されていれば、それに一致するパスは削除候補から外す
+// (download 側 destination=local で .gitignore 対象の局所ファイルを保護する用途)。
+// upload 側 destination=remote では shouldSkipDelete=null で渡されるため、
+// local に無い remote のものは ALWAYS_EXCLUDE 以外すべて削除候補となる。
 async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSkipDelete }) {
   if (!mirror) return { dirs: [], files: [] }
 
