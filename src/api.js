@@ -1,8 +1,17 @@
 import { Buffer } from 'node:buffer'
+import { setTimeout as delay } from 'node:timers/promises'
 import { GoogleAuth } from 'google-auth-library'
 import { filterAlwaysExcluded } from './exclude.js'
 
 const API_ROOT = 'https://dataform.googleapis.com/v1'
+
+// per-request タイムアウト。Dataform API はワークスペース変更系で稀に長く掛かるが、
+// ハングを防ぐため 60s で打ち切る。
+const REQUEST_TIMEOUT_MS = 60_000
+// 5xx / 429 / ネットワークエラーのみ指数バックオフでリトライする。
+// 書き込み系 (writeFile / removeFile / removeDirectory / makeDirectory) は idempotent。
+const MAX_RETRIES = 3
+const BACKOFF_BASE_MS = 500
 
 export class DataformClient {
   constructor({ project, location, repository, workspace }) {
@@ -32,9 +41,10 @@ export class DataformClient {
   async listAll() {
     const files = new Map()
     const dirs = []
+    // 探索順は問わないため pop で O(n) スタック動作にする (shift は O(n²))。
     const pending = ['']
     while (pending.length > 0) {
-      const dir = pending.shift()
+      const dir = pending.pop()
       for await (const entry of this.#iterateDirectory(dir)) {
         if (typeof entry.file === 'string') {
           const raw = entry.metadata?.sizeBytes
@@ -84,18 +94,55 @@ export class DataformClient {
   }
 
   async #request(method, url, body) {
+    let attempt = 0
+    while (true) {
+      try {
+        return await this.#fetchOnce(method, url, body)
+      } catch (err) {
+        if (attempt >= MAX_RETRIES || !isRetriable(err)) throw err
+        const wait = retryDelayMs(err, attempt)
+        attempt++
+        await delay(wait)
+      }
+    }
+  }
+
+  async #fetchOnce(method, url, body) {
     const token = await this.#accessToken()
-    const res = await fetch(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    })
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+    let res
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      })
+    } catch (err) {
+      // タイムアウト由来の AbortError は識別しやすいエラーに包んで上に伝播させる。
+      if (err?.name === 'AbortError') {
+        throw new HttpRequestError(`${method} ${url} -> timeout (${REQUEST_TIMEOUT_MS}ms)`, {
+          retriable: true,
+        })
+      }
+      throw new HttpRequestError(`${method} ${url} -> network error: ${err.message}`, {
+        cause: err,
+        retriable: true,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
     if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`${method} ${url} -> ${res.status}: ${text}`)
+      const text = await res.text().catch(() => '')
+      throw new HttpRequestError(`${method} ${url} -> ${res.status}: ${text}`, {
+        status: res.status,
+        retryAfter: parseRetryAfter(res.headers.get('retry-after')),
+        retriable: res.status >= 500 || res.status === 429,
+      })
     }
     if (res.status === 204) return {}
     const contentType = res.headers.get('content-type') ?? ''
@@ -110,9 +157,42 @@ export class DataformClient {
   }
 }
 
+class HttpRequestError extends Error {
+  constructor(message, { status = null, retryAfter = null, retriable = false, cause } = {}) {
+    super(message)
+    this.name = 'HttpRequestError'
+    this.status = status
+    this.retryAfter = retryAfter
+    this.retriable = retriable
+    if (cause) this.cause = cause
+  }
+}
+
+function isRetriable(err) {
+  return err instanceof HttpRequestError && err.retriable
+}
+
+function retryDelayMs(err, attempt) {
+  const fromHeader = err instanceof HttpRequestError ? err.retryAfter : null
+  if (fromHeader != null) return fromHeader
+  // 指数バックオフ + 軽い jitter (フルジッタ)。
+  const exp = BACKOFF_BASE_MS * 2 ** attempt
+  return Math.floor(Math.random() * exp)
+}
+
+function parseRetryAfter(value) {
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
+  const dateMs = Date.parse(value)
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now())
+  return null
+}
+
 // shouldSkipDelete: --mirror 削除時にスキップ判定する述語
 // (呼び出し側はローカルの完全 ignore を渡すことで、remote 側の
 // ローカル除外対象パスの削除を防げる)。
+/** @returns {import('./sync.js').Side} */
 export function remoteSide(client, { shouldSkipDelete = null } = {}) {
   return {
     supportsRecursiveDirDelete: true,

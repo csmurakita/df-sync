@@ -1,9 +1,34 @@
 import { posix } from 'node:path'
+import { runWithLimit } from './concurrency.js'
+
+/**
+ * @typedef {{ sizeBytes: number | null }} FileMeta
+ *
+ * @typedef {{ files: Map<string, FileMeta>, dirs: string[] }} Listing
+ *
+ * @typedef {(relPath: string, isDir: boolean) => boolean | Promise<boolean>} SkipPredicate
+ *
+ * sync が source / destination として扱う最小インターフェイス。
+ * `localSide` (src/local.js) と `remoteSide` (src/api.js) が実装する。
+ *
+ * @typedef {Object} Side
+ * @property {boolean} supportsRecursiveDirDelete - true なら removeDirectory が再帰的に削除する
+ * @property {SkipPredicate | null} shouldSkipDelete - --mirror 削除時にスキップ判定する述語 (任意)
+ * @property {() => Promise<Listing>} list
+ * @property {(relPath: string) => Promise<Buffer>} read
+ * @property {(relPath: string, bytes: Buffer) => Promise<unknown>} write
+ * @property {(relPath: string) => Promise<unknown>} removeFile
+ * @property {(relPath: string) => Promise<unknown>} removeDirectory
+ */
 
 // サイズ一致時のバイト比較で read が重くなるため、ファイル間を並列度制限付きで回す。
 // 書き込み判定は source / destination 両方の listing が既に必要なフィルタ
 // (ALWAYS_EXCLUDE など) を適用済みである前提で、内容比較のみを行う。
 const CLASSIFY_CONCURRENCY = 8
+
+// shouldSkipDelete は git check-ignore への async 問い合わせになり得るので
+// 削除候補が大量にあるときのバックログを抑える。
+const SKIP_DELETE_CONCURRENCY = 16
 
 export async function sync({ source, destination, mirror, dryRun, log = defaultLog }) {
   log('source / destination を走査...')
@@ -55,6 +80,9 @@ async function selectFilesToWrite(source, destination, src, dst) {
 
 async function classify(source, destination, relPath, srcMeta, dstMeta) {
   if (!dstMeta) return { write: true, reason: 'new' }
+  // sizeBytes は remote API が稀に欠落 (null) させる。両方 null の場合だけは
+  // null !== null === false で size-differs に倒れず、後段のバイト比較に進む。
+  // 片方だけ null なら不一致扱いで write させる (誤判定でもデータ損失より安全側)。
   if (srcMeta.sizeBytes !== dstMeta.sizeBytes) {
     return { write: true, reason: 'size-differs' }
   }
@@ -64,21 +92,6 @@ async function classify(source, destination, relPath, srcMeta, dstMeta) {
   ])
   if (srcBytes.equals(dstBytes)) return { write: false }
   return { write: true, reason: 'content-differs', bytes: srcBytes }
-}
-
-// 並列度制限付き map。結果は入力順で返る。
-async function runWithLimit(items, limit, task) {
-  const results = new Array(items.length)
-  let cursor = 0
-  const worker = async () => {
-    while (cursor < items.length) {
-      const i = cursor++
-      results[i] = await task(items[i], i)
-    }
-  }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, worker)
-  await Promise.all(workers)
-  return results
 }
 
 // mirror が false なら削除対象は空。
@@ -96,9 +109,13 @@ async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSki
   let candidateDirs = dst.dirs.filter((d) => !srcAncestors.has(d))
 
   if (shouldSkipDelete) {
-    const fileSkips = await Promise.all(candidateFiles.map((f) => shouldSkipDelete(f, false)))
+    const fileSkips = await runWithLimit(candidateFiles, SKIP_DELETE_CONCURRENCY, (f) =>
+      shouldSkipDelete(f, false),
+    )
     candidateFiles = candidateFiles.filter((_, i) => !fileSkips[i])
-    const dirSkips = await Promise.all(candidateDirs.map((d) => shouldSkipDelete(d, true)))
+    const dirSkips = await runWithLimit(candidateDirs, SKIP_DELETE_CONCURRENCY, (d) =>
+      shouldSkipDelete(d, true),
+    )
     candidateDirs = candidateDirs.filter((_, i) => !dirSkips[i])
   }
 

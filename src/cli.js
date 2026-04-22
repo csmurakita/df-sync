@@ -1,9 +1,9 @@
 import { readFile, stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { Command } from 'commander'
-import { DataformClient, remoteSide } from './api.js'
+import { DataformClient } from './api.js'
 import { buildIgnorePredicate } from './gitignore.js'
-import { localSide } from './local.js'
+import { createSides } from './sides.js'
 import { sync } from './sync.js'
 
 const CREDENTIALS_FILENAME = '.df-credentials.json'
@@ -42,7 +42,7 @@ async function run(direction, opts) {
 
   const fullIgnore = await buildIgnorePredicate(localDir)
   try {
-    const { source, destination } = buildSides(direction, { localDir, client, fullIgnore })
+    const { source, destination } = createSides(direction, { localDir, client, fullIgnore })
 
     console.log(
       `${direction}: ${direction === 'upload' ? `${localDir} → ${opts.workspace}` : `${opts.workspace} → ${localDir}`}` +
@@ -57,22 +57,6 @@ async function run(direction, opts) {
     })
   } finally {
     fullIgnore.dispose?.()
-  }
-}
-
-// 方向別の source / destination 構成:
-//  upload   : source=local (full ignore で列挙),   destination=remote (mirror 削除時のみ local ignore で保護)
-//  download : source=remote (ALWAYS_EXCLUDE のみ), destination=local  (ALWAYS_EXCLUDE のみで列挙し remote 内容を忠実に反映、mirror 削除時は local ignore で保護)
-function buildSides(direction, { localDir, client, fullIgnore }) {
-  if (direction === 'upload') {
-    return {
-      source: localSide(localDir, { listFilter: fullIgnore }),
-      destination: remoteSide(client, { shouldSkipDelete: fullIgnore }),
-    }
-  }
-  return {
-    source: remoteSide(client),
-    destination: localSide(localDir, { shouldSkipDelete: fullIgnore }),
   }
 }
 
@@ -98,20 +82,15 @@ async function resolveProjectAndLocation(opts, localDir) {
     return { project: opts.project, location: opts.location }
   }
   const credentials = await readCredentials(localDir)
-  const project = assertConfig(
-    opts.project ?? credentials?.projectId,
-    `--project が未指定で ${CREDENTIALS_FILENAME} からも解決できませんでした`,
-  )
-  const location = assertConfig(
-    opts.location ?? credentials?.location,
-    `--location が未指定で ${CREDENTIALS_FILENAME} からも解決できませんでした`,
-  )
+  const project = opts.project ?? credentials?.projectId
+  if (!project) {
+    throw new Error(`--project が未指定で ${CREDENTIALS_FILENAME} からも解決できませんでした`)
+  }
+  const location = opts.location ?? credentials?.location
+  if (!location) {
+    throw new Error(`--location が未指定で ${CREDENTIALS_FILENAME} からも解決できませんでした`)
+  }
   return { project, location }
-}
-
-function assertConfig(value, message) {
-  if (!value) throw new Error(message)
-  return value
 }
 
 async function readCredentials(localDir) {
