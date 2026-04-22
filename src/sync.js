@@ -11,11 +11,13 @@ import { runWithLimit } from './concurrency.js'
  * sync が source / destination として扱う最小インターフェイス。
  * `localSide` / `remoteSide` (src/sides.js) が実装する。
  *
+ * @typedef {{ shouldSkipDescent?: ((dirPath: string) => boolean) | null }} ListOptions
+ *
  * @typedef {Object} Side
  * @property {boolean} supportsRecursiveDirDelete - true なら removeDirectory が再帰的に削除する
  * @property {SkipPredicate | null} shouldSkipDelete - --mirror 削除時にスキップ判定する述語 (任意、download 側 destination でのみ使用)
  * @property {((relPath: string) => boolean) | null} shouldSkipWrite - 書き込み計画から除外するパス判定 (任意、destination=local が ALWAYS_EXCLUDE を弾くために使う)
- * @property {() => Promise<Listing>} list
+ * @property {(options?: ListOptions) => Promise<Listing>} list - shouldSkipDescent が指定されたら、その dir 配下の列挙を省ける (実装側の最適化、未対応でも結果は同じ)
  * @property {(relPath: string) => Promise<Buffer>} read
  * @property {(relPath: string, bytes: Buffer) => Promise<unknown>} write
  * @property {(relPath: string) => Promise<unknown>} removeFile
@@ -32,9 +34,16 @@ const CLASSIFY_CONCURRENCY = 8
 const SKIP_DELETE_CONCURRENCY = 16
 
 export async function sync({ source, destination, mirror, dryRun, log = defaultLog }) {
-  log('source / destination を走査...')
-  const [src, dst] = await Promise.all([source.list(), destination.list()])
+  // 列挙は順次に行う:
+  //  1. source 列挙時、destination が書き込みを拒否する dir (e.g. download の ALWAYS_EXCLUDE)
+  //     には潜らない — 余計な API コールを避ける
+  //  2. destination 列挙時は src の dir 集合を文脈に枝刈り (詳細は makeDestinationDescentSkip)
+  log('source を走査...')
+  const src = await source.list({ shouldSkipDescent: makeSourceDescentSkip(destination) })
   log(`  source:      ファイル ${src.files.size} 件 / ディレクトリ ${src.dirs.length} 件`)
+
+  log('destination を走査...')
+  const dst = await destination.list({ shouldSkipDescent: makeDestinationDescentSkip(src, destination, mirror) })
   log(`  destination: ファイル ${dst.files.size} 件 / ディレクトリ ${dst.dirs.length} 件`)
 
   log('書き込み対象を判定中 (サイズ比較 → バイト比較)...')
@@ -63,6 +72,36 @@ export async function sync({ source, destination, mirror, dryRun, log = defaultL
 
 function defaultLog(...args) {
   console.log(...args)
+}
+
+// source 列挙時の枝刈り: destination が書き込みを拒否する dir 配下は source からも見ない
+// (読んでも書けないので無駄)。download の remote 側で ALWAYS_EXCLUDE 配下の API コールを避ける用途。
+function makeSourceDescentSkip(destination) {
+  const skipWrite = destination.shouldSkipWrite
+  return skipWrite ? (dirPath) => skipWrite(dirPath) : null
+}
+
+// destination 列挙時の枝刈り:
+//  - destination.shouldSkipWrite に該当する dir (書かない dir 配下は不要)
+//  - src に対応 dir が無く、かつ「no-mirror (削除しない)」または
+//    「mirror かつ recursive 削除可 (rmdir 一発で消す)」 — 配下を個別に知る必要がない
+// (mirror かつ非再帰削除 = download --mirror では、local-only ファイルを個別削除するために
+//  全列挙が必要なので枝刈りしない)
+function makeDestinationDescentSkip(src, destination, mirror) {
+  const skipWrite = destination.shouldSkipWrite
+  const canSkipDstOnly = !mirror || destination.supportsRecursiveDirDelete
+  if (!skipWrite && !canSkipDstOnly) return null
+
+  let srcKnown = null
+  if (canSkipDstOnly) {
+    srcKnown = new Set(src.dirs)
+    for (const a of collectAncestorDirs(src.files.keys())) srcKnown.add(a)
+  }
+  return (dirPath) => {
+    if (skipWrite && skipWrite(dirPath)) return true
+    if (canSkipDstOnly && !srcKnown.has(dirPath)) return true
+    return false
+  }
 }
 
 async function selectFilesToWrite(source, destination, src, dst) {

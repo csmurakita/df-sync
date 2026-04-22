@@ -37,7 +37,9 @@ export class DataformClient {
     return this.#post(':makeDirectory', { path })
   }
 
-  async listAll() {
+  // shouldSkipDescent(dirPath) が true を返したディレクトリには再帰しない (dir 自体は dirs に残す)。
+  // 削除予定や書き込み拒否の dir 配下を列挙しないことで、巨大ツリー (例: node_modules) の API コストを回避する。
+  async listAll({ shouldSkipDescent = null } = {}) {
     const files = new Map()
     const dirs = []
     // 探索順は問わないため pop で O(n) スタック動作にする (shift は O(n²))。
@@ -51,7 +53,9 @@ export class DataformClient {
           files.set(entry.file, { sizeBytes })
         } else if (typeof entry.directory === 'string') {
           dirs.push(entry.directory)
-          pending.push(entry.directory)
+          if (!shouldSkipDescent || !shouldSkipDescent(entry.directory)) {
+            pending.push(entry.directory)
+          }
         }
       }
     }

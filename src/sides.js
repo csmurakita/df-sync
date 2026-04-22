@@ -28,6 +28,7 @@ export function localSide(root, { listFilter = null, shouldSkipDelete = null } =
     supportsRecursiveDirDelete: false,
     shouldSkipDelete,
     shouldSkipWrite: matchesAlwaysExclude,
+    // options.shouldSkipDescent は受けるが使わない: local 列挙は安価で、enumerateLocal が ALWAYS_EXCLUDE を walk 時に枝刈りしている
     async list() {
       return enumerateLocal(root, listFilter)
     },
@@ -54,8 +55,8 @@ export function remoteSide(client) {
     supportsRecursiveDirDelete: true,
     shouldSkipDelete: null,
     shouldSkipWrite: null,
-    async list() {
-      return client.listAll()
+    async list(options) {
+      return client.listAll(options)
     },
     async read(relPath) {
       return client.readFile(relPath)
