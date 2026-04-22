@@ -1,23 +1,25 @@
 import { posix } from 'node:path'
 
-export async function sync({ source, destination, mirror, dryRun, ignorePath }) {
+export async function sync({ source, destination, mirror, dryRun }) {
   console.log('source を走査...')
-  const src = applyIgnore(await source.list(), ignorePath)
+  const src = await source.list()
   console.log(`  ファイル ${src.files.size} 件 / ディレクトリ ${src.dirs.length} 件`)
 
   console.log('destination を走査...')
-  const dst = applyIgnore(await destination.list(), ignorePath)
+  const dst = await destination.list()
   console.log(`  ファイル ${dst.files.size} 件 / ディレクトリ ${dst.dirs.length} 件`)
-
-  const deletePlan = buildDeletePlan(src, dst, {
-    mirror,
-    recursiveDirDelete: Boolean(destination.supportsRecursiveDirDelete),
-  })
 
   console.log('書き込み対象を判定中 (サイズ比較 → バイト比較)...')
   const { filesToWrite, skipped } = await selectFilesToWrite(source, destination, src, dst)
+
+  const deletePlan = await buildDeletePlan(src, dst, {
+    mirror,
+    recursiveDirDelete: Boolean(destination.supportsRecursiveDirDelete),
+    shouldSkipDelete: destination.shouldSkipDelete,
+  })
+
   console.log(
-    `計画: ディレクトリ削除 ${deletePlan.dirs.length} / ファイル削除 ${deletePlan.files.length} / 書き込み ${filesToWrite.length} (内容一致でスキップ ${skipped})`,
+    `計画: ディレクトリ削除 ${deletePlan.dirs.length} / ファイル削除 ${deletePlan.files.length} / 書き込み ${filesToWrite.length} (スキップ ${skipped})`,
   )
 
   if (dryRun) {
@@ -29,29 +31,9 @@ export async function sync({ source, destination, mirror, dryRun, ignorePath }) 
   console.log('同期完了')
 }
 
-// mirror が false なら削除対象は空。
-// recursiveDirDelete が true なら dst の空でないディレクトリを rmdir で一括削除できる (remote 向け)。
-// false の場合は destination 側が ignored ファイル等を巻き込むリスクがあるため
-// 列挙済みファイルのみ個別に削除する (local 向け)。
-function buildDeletePlan(src, dst, { mirror, recursiveDirDelete }) {
-  if (!mirror) return { dirs: [], files: [] }
-
-  const srcFiles = new Set(src.files.keys())
-  const srcAncestors = collectAncestorDirs(srcFiles)
-
-  if (recursiveDirDelete) {
-    const dirs = minimizeDirs(dst.dirs.filter((d) => !srcAncestors.has(d)))
-    const deletedDirSet = new Set(dirs)
-    const files = [...dst.files.keys()].filter(
-      (f) => !srcFiles.has(f) && !hasAncestorIn(f, deletedDirSet),
-    )
-    return { dirs, files }
-  }
-
-  const files = [...dst.files.keys()].filter((f) => !srcFiles.has(f))
-  return { dirs: [], files }
-}
-
+// 書き込み判定は source / destination 両方の listing が既に
+// 必要なフィルタ (ALWAYS_EXCLUDE など) を適用済みである前提で、
+// 内容比較のみを行う。
 async function selectFilesToWrite(source, destination, src, dst) {
   const filesToWrite = []
   let skipped = 0
@@ -79,6 +61,37 @@ async function classify(source, destination, relPath, srcMeta, dstMeta) {
   return { write: true, reason: 'content-differs' }
 }
 
+// mirror が false なら削除対象は空。
+// recursiveDirDelete が true なら dst のディレクトリを rmdir 一括削除できる (remote 向け)。
+// false の場合は列挙済みファイルのみ個別削除する (local 向け)。
+// shouldSkipDelete で守られたパスは削除候補から外す
+// (ローカルの .gitignore / ALWAYS_EXCLUDE 対象を両方向のミラー削除から保護する用途)。
+async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSkipDelete }) {
+  if (!mirror) return { dirs: [], files: [] }
+
+  const srcFiles = new Set(src.files.keys())
+  const srcAncestors = collectAncestorDirs(srcFiles)
+
+  let candidateFiles = [...dst.files.keys()].filter((f) => !srcFiles.has(f))
+  let candidateDirs = dst.dirs.filter((d) => !srcAncestors.has(d))
+
+  if (shouldSkipDelete) {
+    const fileSkips = await Promise.all(candidateFiles.map((f) => shouldSkipDelete(f, false)))
+    candidateFiles = candidateFiles.filter((_, i) => !fileSkips[i])
+    const dirSkips = await Promise.all(candidateDirs.map((d) => shouldSkipDelete(d, true)))
+    candidateDirs = candidateDirs.filter((_, i) => !dirSkips[i])
+  }
+
+  if (recursiveDirDelete) {
+    const dirs = minimizeDirs(candidateDirs)
+    const deletedDirSet = new Set(dirs)
+    const files = candidateFiles.filter((f) => !hasAncestorIn(f, deletedDirSet))
+    return { dirs, files }
+  }
+
+  return { dirs: [], files: candidateFiles }
+}
+
 function printDryRun(plan, filesToWrite) {
   for (const d of plan.dirs) console.log(`  rmdir ${d}`)
   for (const f of plan.files) console.log(`  rm    ${f}`)
@@ -102,19 +115,6 @@ async function execute(destination, source, plan, filesToWrite) {
     const bytes = await source.read(file.relPath)
     await destination.write(file.relPath, bytes)
   }
-}
-
-// ignore ルール (ローカルの .gitignore と ALWAYS_EXCLUDE) を source/destination 双方に適用する。
-// これにより download 時にリモートの ignored パスがローカルに書き込まれることも、
-// upload --mirror 時にリモートの ignored パスが削除されることも防ぐ。
-function applyIgnore(listing, ignorePath) {
-  if (!ignorePath) return listing
-  const files = new Map()
-  for (const [p, m] of listing.files) {
-    if (!ignorePath(p, false)) files.set(p, m)
-  }
-  const dirs = listing.dirs.filter((d) => !ignorePath(d, true))
-  return { files, dirs }
 }
 
 function collectAncestorDirs(relPaths) {

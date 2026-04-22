@@ -39,12 +39,19 @@ async function run(direction, opts) {
   const { repository, workspace } = parseWorkspace(opts.workspace)
   const client = new DataformClient({ project, location, repository, workspace })
 
-  const local = localSide(localDir)
-  const remote = remoteSide(client)
-  const ignorePath = await buildIgnorePredicate(localDir)
+  const fullIgnore = await buildIgnorePredicate(localDir)
 
-  const [source, destination] =
-    direction === 'upload' ? [local, remote] : [remote, local]
+  // 方向別の側構成:
+  //  upload   : source=local (full ignore で列挙),      destination=remote (mirror 削除時のみ local ignore で保護)
+  //  download : source=remote (ALWAYS_EXCLUDE のみ),    destination=local  (ALWAYS_EXCLUDE のみで列挙し remote 内容を忠実に反映, mirror 削除時は local ignore で保護)
+  let source, destination
+  if (direction === 'upload') {
+    source = localSide(localDir, { listFilter: fullIgnore })
+    destination = remoteSide(client, { shouldSkipDelete: fullIgnore })
+  } else {
+    source = remoteSide(client)
+    destination = localSide(localDir, { shouldSkipDelete: fullIgnore })
+  }
 
   console.log(
     `${direction}: ${direction === 'upload' ? `${localDir} → ${opts.workspace}` : `${opts.workspace} → ${localDir}`}` +
@@ -56,7 +63,6 @@ async function run(direction, opts) {
     destination,
     mirror: Boolean(opts.mirror),
     dryRun: Boolean(opts.dryRun),
-    ignorePath,
   })
 }
 

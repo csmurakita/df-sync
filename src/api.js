@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { GoogleAuth } from 'google-auth-library'
+import { matchesAlwaysExclude } from './local.js'
 
 const API_ROOT = 'https://dataform.googleapis.com/v1'
 
@@ -100,11 +101,21 @@ export class DataformClient {
   }
 }
 
-export function remoteSide(client) {
+// shouldSkipDelete: --mirror 削除時にスキップ判定する述語
+// (呼び出し側はローカルの完全 ignore を渡すことで、remote 側の
+// ローカル除外対象パスの削除を防げる)。
+export function remoteSide(client, { shouldSkipDelete = null } = {}) {
   return {
     supportsRecursiveDirDelete: true,
+    shouldSkipDelete,
     async list() {
-      return client.listAll()
+      const { files, dirs } = await client.listAll()
+      const filteredFiles = new Map()
+      for (const [p, m] of files) {
+        if (!matchesAlwaysExclude(p)) filteredFiles.set(p, m)
+      }
+      const filteredDirs = dirs.filter((d) => !matchesAlwaysExclude(d))
+      return { files: filteredFiles, dirs: filteredDirs }
     },
     async read(relPath) {
       return client.readFile(relPath)
