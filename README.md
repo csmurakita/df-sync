@@ -7,13 +7,8 @@
 
 - `upload` / `download` サブコマンドで双方向に同期可能
 - `--mirror` 時のみ対向に存在しないファイル/ディレクトリを削除（既定は書き込みのみの非破壊動作）
-- 内容が一致するファイルは書き込みをスキップ（ファイルサイズ → バイト比較の 2 段階判定）
-- `.git` / `node_modules` / `.df-credentials.json` は両方向で常に除外
-- ローカルの `.gitignore` は以下の場面でのみ使用:
-  - `upload` 時の source 列挙（ignored ファイルを「上げない」）
-  - `--mirror` 時の削除判定（ignored パスに一致する destination のファイル/ディレクトリを「削除しない」、これは upload/download 両方向に適用）
-  - `download` 時の書き込み判定には **関与しない** ので、リモートに `.gitignore` 対象パスのファイルがあれば忠実に取得する
-- ローカルディレクトリが git 管理下なら `git check-ignore` を使用し、ネストされた `.gitignore` やグローバル設定も尊重する（git 不在時は root 直下の `.gitignore` にフォールバック）
+- 内容が一致するファイルは書き込みをスキップ
+- `.gitignore` に従って同期対象を制御（git 管理下ならネストされた `.gitignore` やグローバル設定にも対応）
 - `.df-credentials.json` の `projectId` / `location` を自動フォールバック
 - `--dry-run` で計画だけ確認可能
 
@@ -25,7 +20,7 @@
   - `GOOGLE_APPLICATION_CREDENTIALS` にサービスアカウントキーのパス
 - 認証主体が対象リポジトリに対して `dataform.workspaces.writeFile` などの権限を持つこと
   （例: `roles/dataform.editor` もしくは相当のカスタムロール）
-- （任意）`git` コマンドが PATH にあれば `git check-ignore` を用いたより正確な無視判定が有効になる。無くても root の `.gitignore` を見る簡易実装で動作する
+- （任意）PATH に `git` があれば `.gitignore` をより厳密に解釈する（ネスト・グローバル設定等）
 
 ## インストール / 実行
 
@@ -99,38 +94,32 @@ df-sync upload \
 
 ## 同期の挙動
 
-upload / download とも共通の流れ:
+`upload` / `download` とも以下のルールで同期する:
 
-1. source / destination 両方をサイズ付きで列挙
-   - source が local (upload): `.gitignore` + 常時除外ルールを適用し、`stat` でサイズ取得
-   - source が remote (download): `queryDirectoryContents`（`view=DIRECTORY_CONTENTS_VIEW_METADATA`）で再帰取得し、常時除外ルールのみフィルタ
-   - destination が local (download): 常時除外ルールのみ適用し `stat` でサイズ取得（ignored ファイルも列挙して比較対象に含める＝リモート内容を忠実に反映）
-   - destination が remote (upload): `queryDirectoryContents` で取得し、常時除外ルールのみフィルタ
-2. 各 source ファイルを destination と照合して書き込み判定
-   - destination に存在しない → 書き込み
-   - サイズが異なる → 書き込み
-   - サイズ一致 → destination から内容を取得し、source とバイト比較。一致ならスキップ、不一致なら書き込み
-3. `--mirror` 指定時のみ、source に無い destination のファイル/ディレクトリを削除対象に含める
-   - upload: remote 側のディレクトリは `removeDirectory` で一括削除（親子で重複する場合は親のみ）
-   - download: local 側は列挙済みファイルを個別 `unlink`（`.gitignore` 済みファイルを巻き込まないため、再帰削除は行わない）
-   - **ローカルの `.gitignore` / 常時除外ルールに一致するパスは削除候補から除外**する。これは upload/download 両方向に適用され、ローカルで除外している対象が相手側に存在しても削除されない
-4. Dataform API が並列の変更呼び出しを許さないため、すべて**直列**で実行
+- 対向に存在しないファイル → 書き込み
+- 内容が一致するファイル → スキップ
+- 内容が異なるファイル → 書き込み
+- `--mirror` 指定時のみ、source に無い destination のファイル/ディレクトリを削除
 
-コミット（`commit` / `push`）は行わない。upload 時の変更はワークスペースの「未コミット状態」として残る。
+コミット（`commit` / `push`）は行わない。`upload` 時の変更はワークスペースの「未コミット状態」として残る。
 
 ## 除外ルール
 
-常に除外されるもの（`.gitignore` に無くても対象外）:
+常に除外されるパス（両方向で同期対象外）:
 
 - `.git/`
 - `node_modules/`
 - `.df-credentials.json`
 
-同期元ディレクトリ直下の `.gitignore` があれば追加で適用される。
+ローカルの `.gitignore` は以下の場面でのみ適用される:
+
+- `upload` 時の同期対象列挙: ignored ファイルは **アップロードしない**
+- `--mirror` 時の削除判定: ignored パスに一致する destination のファイル/ディレクトリは **削除しない**（upload / download 両方向）
+- `download` 時の書き込み判定には **影響しない**（リモートに ignored パスのファイルがあれば忠実に取得する）
 
 ## 注意
 
 - `--mirror` 指定時は対向の未同期変更が失われる可能性がある。実行前に `--dry-run` で計画を確認すること
-- BigQuery/Snowflake 接続情報を含む `.df-credentials.json` は常時除外の対象なので、upload / download いずれでも触らない（リモートに存在しても download で上書きされない、`--mirror` でも削除されない）
-- `download` はリモート内容を忠実に反映するため、リモートに `.gitignore` 対象パスのファイル（例: `build/` 配下）があればローカルに書き込まれる（既存のローカル ignored ファイルも上書きされ得る）。意図しない上書きを避けたい場合は事前に `--dry-run` で計画を確認すること
+- `download` はリモート内容を忠実に反映するため、リモートに `.gitignore` 対象パスのファイル（例: `build/` 配下）があればローカルに書き込まれる（既存のローカル ignored ファイルも上書きされ得る）
+- BigQuery/Snowflake 接続情報を含む `.df-credentials.json` は常時除外の対象で、`upload` / `download` いずれでも触らない
 - リポジトリ ID / ワークスペース ID はあらかじめ GCP 側で存在している必要がある（この CLI は作成しない）
