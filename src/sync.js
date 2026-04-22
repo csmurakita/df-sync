@@ -1,13 +1,10 @@
 import { posix } from 'node:path'
 
 export async function sync({ source, destination, mirror, dryRun }) {
-  console.log('source を走査...')
-  const src = await source.list()
-  console.log(`  ファイル ${src.files.size} 件 / ディレクトリ ${src.dirs.length} 件`)
-
-  console.log('destination を走査...')
-  const dst = await destination.list()
-  console.log(`  ファイル ${dst.files.size} 件 / ディレクトリ ${dst.dirs.length} 件`)
+  console.log('source / destination を走査...')
+  const [src, dst] = await Promise.all([source.list(), destination.list()])
+  console.log(`  source:      ファイル ${src.files.size} 件 / ディレクトリ ${src.dirs.length} 件`)
+  console.log(`  destination: ファイル ${dst.files.size} 件 / ディレクトリ ${dst.dirs.length} 件`)
 
   console.log('書き込み対象を判定中 (サイズ比較 → バイト比較)...')
   const { filesToWrite, skipped } = await selectFilesToWrite(source, destination, src, dst)
@@ -31,20 +28,36 @@ export async function sync({ source, destination, mirror, dryRun }) {
   console.log('同期完了')
 }
 
+// サイズ一致時のバイト比較で read が重くなるため、ファイル間を並列度制限付きで回す。
 // 書き込み判定は source / destination 両方の listing が既に
 // 必要なフィルタ (ALWAYS_EXCLUDE など) を適用済みである前提で、
 // 内容比較のみを行う。
+const CLASSIFY_CONCURRENCY = 8
+
 async function selectFilesToWrite(source, destination, src, dst) {
+  const entries = [...src.files]
   const filesToWrite = []
   let skipped = 0
-  for (const [relPath, srcMeta] of src.files) {
-    const decision = await classify(source, destination, relPath, srcMeta, dst.files.get(relPath))
-    if (decision.write) {
-      filesToWrite.push({ relPath, reason: decision.reason })
-    } else {
-      skipped++
+  let cursor = 0
+
+  async function worker() {
+    while (cursor < entries.length) {
+      const i = cursor++
+      const [relPath, srcMeta] = entries[i]
+      const decision = await classify(source, destination, relPath, srcMeta, dst.files.get(relPath))
+      if (decision.write) {
+        filesToWrite.push({ relPath, reason: decision.reason })
+      } else {
+        skipped++
+      }
     }
   }
+
+  const workers = Array.from(
+    { length: Math.min(CLASSIFY_CONCURRENCY, entries.length) },
+    () => worker(),
+  )
+  await Promise.all(workers)
   return { filesToWrite, skipped }
 }
 
