@@ -31,7 +31,7 @@ function applyCommonOptions(cmd) {
     .option('-l, --location <id>', `ロケーション 例: us-central1 (省略時は ${CREDENTIALS_FILENAME} の location)`)
     .option('-d, --dir <path>', 'ローカルディレクトリ (省略時はカレントディレクトリ)')
     .option('-n, --dry-run', '実行せず計画だけ表示する', false)
-    .option('--mirror', '対向に存在しないファイル/ディレクトリを削除する (破壊的)', false)
+    .option('-m, --mirror', '対向に存在しないファイル/ディレクトリを削除する (破壊的)', false)
 }
 
 async function run(direction, opts) {

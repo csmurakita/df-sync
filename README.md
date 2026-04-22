@@ -59,11 +59,21 @@ df-sync <upload|download> --workspace <repository>/<workspace> \
 | `-l, --location <id>` | | ロケーション（例: `asia-northeast1`）。省略時は `.df-credentials.json` の `location` |
 | `-d, --dir <path>` | | ローカルディレクトリ。省略時はカレントディレクトリ |
 | `-n, --dry-run` | | 実行せず計画のみ表示 |
-| `--mirror` | | 対向に存在しないファイル/ディレクトリを削除（**破壊的**、既定無効） |
+| `-m, --mirror` | | 対向に存在しないファイル/ディレクトリを削除（**破壊的**、既定無効） |
 
 ### 例
 
-最小構成 (upload, 非破壊):
+明示指定:
+
+```bash
+df-sync upload \
+  --project my-gcp-project \
+  --location asia-northeast1 \
+  --workspace sample/dev \
+  --dir ./my-dataform-project
+```
+
+最小構成 (upload, 非破壊、`--project` / `--location` はカレントディレクトリの `.df-credentials.json` から解決):
 
 ```bash
 cd my-dataform-project
@@ -80,16 +90,6 @@ df-sync upload --workspace sample/dev --mirror
 
 ```bash
 df-sync download --workspace sample/dev --dir ./my-dataform-project
-```
-
-明示指定:
-
-```bash
-df-sync upload \
-  --project my-gcp-project \
-  --location asia-northeast1 \
-  --workspace sample/dev \
-  --dir ./my-dataform-project
 ```
 
 ## 同期の挙動
