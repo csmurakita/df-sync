@@ -4,10 +4,18 @@ import { join } from 'node:path'
 import ignore from 'ignore'
 import { matchesAlwaysExclude } from './exclude.js'
 
+/**
+ * gitignore 述語。`(relPath, isDir) => boolean | Promise<boolean>` を満たし、
+ * `dispose()` で裏で走らせている子プロセスのクリーンアップを行う。
+ *
+ * @typedef {((relPath: string, isDir: boolean) => Promise<boolean>) & { dispose: () => void }} IgnorePredicate
+ */
+
 // git が利用可能かつ root が git リポジトリ配下なら git check-ignore で判定する
 // (ネストされた .gitignore やグローバル設定も尊重される)。
 // 利用不可の場合は ignore パッケージ + root/.gitignore にフォールバック。
-// 返り値の関数には dispose() が付く (git 子プロセスのクリーンアップ用)。
+// どちらの分岐でも dispose() は必ず生える (fallback 側は no-op)。
+/** @returns {Promise<IgnorePredicate>} */
 export async function buildIgnorePredicate(root) {
   if (await isInsideGitRepo(root)) {
     return createGitIgnorePredicate(root)
@@ -46,15 +54,22 @@ async function createGitIgnorePredicate(root) {
   child.stderr.on('data', () => {})
 
   const queue = []
-  readNullRecords(child.stdout, 4, (fields) => {
-    // -z --non-matching 時、非一致は source フィールドが空文字
-    const matched = fields[0] !== ''
-    queue.shift()?.resolve(matched)
-  })
-
   const fail = (err) => {
     while (queue.length) queue.shift().reject(err)
   }
+  readNullRecords(child.stdout, 4, (fields) => {
+    // -z --non-matching 時、非一致は source フィールドが空文字
+    const matched = fields[0] !== ''
+    const waiter = queue.shift()
+    if (!waiter) {
+      // 1 入力 = 1 レコードの前提 (git check-ignore --verbose --non-matching) が崩れている。
+      // silent に捨てると以降の waiter とレコードの対応付けがズレるので、保留中を含め失敗させる。
+      fail(new Error('git check-ignore が予期しないレコードを出力しました'))
+      return
+    }
+    waiter.resolve(matched)
+  })
+
   child.on('error', fail)
   child.stdin.on('error', fail)
   child.on('exit', (code, signal) => {

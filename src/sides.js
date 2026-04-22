@@ -3,9 +3,8 @@ import { dirname, join } from 'node:path'
 import { matchesAlwaysExclude } from './exclude.js'
 import { enumerateLocal } from './local.js'
 
-// 方向別の source / destination 構成:
-//  upload   : source=local (full ignore で列挙), destination=remote (フィルタ・削除保護なし: local に無いものはすべて削除候補)
-//  download : source=remote (フィルタなし、remote が返したものを忠実にローカルへ反映), destination=local (ALWAYS_EXCLUDE のみで列挙、mirror 削除時のみ local ignore で保護)
+// upload   は source=local / destination=remote、download はその逆。
+// 各方向での fullIgnore の適用位置 (listFilter / shouldSkipDelete) は下の return で対称に表現している。
 export function createSides(direction, { localDir, client, fullIgnore }) {
   if (direction === 'upload') {
     return {
@@ -19,10 +18,16 @@ export function createSides(direction, { localDir, client, fullIgnore }) {
   }
 }
 
-// listFilter      : list() に適用する ignore 述語。null なら walk の ALWAYS_EXCLUDE のみ。
-// shouldSkipDelete: --mirror 削除時にスキップ判定する述語（完全な local ignore を想定）。
-// shouldSkipWrite : ALWAYS_EXCLUDE (.git / node_modules / .df-credentials.json) を local 書き込みから常に弾く。
-/** @returns {import('./sync.js').Side} */
+/**
+ * @param {string} root
+ * @param {Object} [opts]
+ * @param {import('./gitignore.js').IgnorePredicate | null} [opts.listFilter] - list() に適用する ignore 述語。null なら walk の ALWAYS_EXCLUDE のみ。
+ * @param {import('./gitignore.js').IgnorePredicate | null} [opts.shouldSkipDelete] - --mirror 削除時にスキップ判定する述語 (完全な local ignore を想定)。
+ * @returns {import('./sync.js').Side}
+ *
+ * shouldSkipWrite は固定で matchesAlwaysExclude。
+ * ALWAYS_EXCLUDE (.git / node_modules / .df-credentials.json) を local 書き込みから常に弾く。
+ */
 export function localSide(root, { listFilter = null, shouldSkipDelete = null } = {}) {
   return {
     supportsRecursiveDirDelete: false,

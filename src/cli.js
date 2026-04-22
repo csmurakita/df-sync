@@ -56,7 +56,7 @@ async function run(direction, opts) {
       dryRun: Boolean(opts.dryRun),
     })
   } finally {
-    fullIgnore.dispose?.()
+    fullIgnore.dispose()
   }
 }
 

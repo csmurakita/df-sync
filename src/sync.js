@@ -148,35 +148,53 @@ async function classify(source, destination, relPath, srcMeta, dstMeta) {
 async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSkipDelete }) {
   if (!mirror) return { dirs: [], files: [] }
 
+  const initial = listInitialCandidates(src, dst)
+  const filtered = shouldSkipDelete
+    ? await filterWithSkipDelete(initial, shouldSkipDelete)
+    : initial
+
+  if (recursiveDirDelete) return collapseToRecursiveDelete(filtered)
+  return { dirs: [], files: filtered.files }
+}
+
+// src に存在しないファイル / ディレクトリを削除候補として返す。
+// src の祖先 dir は src.dirs に無くても「src が持っているツリーの一部」なので候補から除外する。
+function listInitialCandidates(src, dst) {
   const srcFiles = new Set(src.files.keys())
   const srcAncestors = collectAncestorDirs(srcFiles)
-
-  let candidateFiles = [...dst.files.keys()].filter((f) => !srcFiles.has(f))
-  let candidateDirs = dst.dirs.filter((d) => !srcAncestors.has(d))
-
-  if (shouldSkipDelete) {
-    // files と dirs を 1 本の runWithLimit に束ねて、並列度 SKIP_DELETE_CONCURRENCY を
-    // 全削除候補で共有する (git check-ignore 呼び出しが 2 波に分かれるのを防ぐ)。
-    const items = [
-      ...candidateFiles.map((path) => ({ path, isDir: false })),
-      ...candidateDirs.map((path) => ({ path, isDir: true })),
-    ]
-    const skips = await runWithLimit(items, SKIP_DELETE_CONCURRENCY, ({ path, isDir }) =>
-      shouldSkipDelete(path, isDir),
-    )
-    const kept = items.filter((_, i) => !skips[i])
-    candidateFiles = kept.filter((x) => !x.isDir).map((x) => x.path)
-    candidateDirs = kept.filter((x) => x.isDir).map((x) => x.path)
+  return {
+    files: [...dst.files.keys()].filter((f) => !srcFiles.has(f)),
+    dirs: dst.dirs.filter((d) => !srcAncestors.has(d)),
   }
+}
 
-  if (recursiveDirDelete) {
-    const dirs = minimizeDirs(candidateDirs)
-    const deletedDirSet = new Set(dirs)
-    const files = candidateFiles.filter((f) => !hasAncestorIn(f, deletedDirSet))
-    return { dirs, files }
+// shouldSkipDelete (download 側 destination=local の .gitignore 保護) を適用する。
+// files と dirs を 1 本の runWithLimit に束ねて、並列度 SKIP_DELETE_CONCURRENCY を
+// 全削除候補で共有する (git check-ignore 呼び出しが 2 波に分かれるのを防ぐ)。
+async function filterWithSkipDelete({ files, dirs }, shouldSkipDelete) {
+  const items = [
+    ...files.map((path) => ({ path, isDir: false })),
+    ...dirs.map((path) => ({ path, isDir: true })),
+  ]
+  const skips = await runWithLimit(items, SKIP_DELETE_CONCURRENCY, ({ path, isDir }) =>
+    shouldSkipDelete(path, isDir),
+  )
+  const kept = items.filter((_, i) => !skips[i])
+  return {
+    files: kept.filter((x) => !x.isDir).map((x) => x.path),
+    dirs: kept.filter((x) => x.isDir).map((x) => x.path),
   }
+}
 
-  return { dirs: [], files: candidateFiles }
+// recursiveDirDelete=true の destination (remote) 向け: dir を rmdir 一発で消す前提で、
+// 親 dir が削除されるファイル/子 dir は候補から外す。
+function collapseToRecursiveDelete({ files, dirs }) {
+  const minimizedDirs = minimizeDirs(dirs)
+  const deletedDirSet = new Set(minimizedDirs)
+  return {
+    dirs: minimizedDirs,
+    files: files.filter((f) => !hasAncestorIn(f, deletedDirSet)),
+  }
 }
 
 // deletePlan と filesToWrite を rmdir → rm → write の単一アクション列に整える。
@@ -216,35 +234,30 @@ async function applyAction(action, source, destination) {
   }
 }
 
+function* iterateAncestors(relPath) {
+  let d = posix.dirname(relPath)
+  while (d && d !== '.') {
+    yield d
+    d = posix.dirname(d)
+  }
+}
+
 function collectAncestorDirs(relPaths) {
   const dirs = new Set()
   for (const p of relPaths) {
-    let d = posix.dirname(p)
-    while (d && d !== '.') {
-      dirs.add(d)
-      d = posix.dirname(d)
-    }
+    for (const a of iterateAncestors(p)) dirs.add(a)
   }
   return dirs
 }
 
 function minimizeDirs(dirs) {
   const set = new Set(dirs)
-  return dirs.filter((d) => {
-    let parent = posix.dirname(d)
-    while (parent && parent !== '.') {
-      if (set.has(parent)) return false
-      parent = posix.dirname(parent)
-    }
-    return true
-  })
+  return dirs.filter((d) => !hasAncestorIn(d, set))
 }
 
-function hasAncestorIn(filePath, dirSet) {
-  let parent = posix.dirname(filePath)
-  while (parent && parent !== '.') {
-    if (dirSet.has(parent)) return true
-    parent = posix.dirname(parent)
+function hasAncestorIn(relPath, dirSet) {
+  for (const a of iterateAncestors(relPath)) {
+    if (dirSet.has(a)) return true
   }
   return false
 }
