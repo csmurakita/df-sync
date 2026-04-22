@@ -99,3 +99,24 @@ export class DataformClient {
     return token
   }
 }
+
+export function remoteSide(client) {
+  return {
+    supportsRecursiveDirDelete: true,
+    async list() {
+      return client.listAll()
+    },
+    async read(relPath) {
+      return client.readFile(relPath)
+    },
+    async write(relPath, bytes) {
+      return client.writeFile(relPath, bytes)
+    },
+    async removeFile(relPath) {
+      return client.removeFile(relPath)
+    },
+    async removeDirectory(relPath) {
+      return client.removeDirectory(relPath)
+    },
+  }
+}
