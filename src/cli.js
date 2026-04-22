@@ -19,19 +19,22 @@ export async function main() {
 
   console.log('リモートワークスペースを走査...')
   const remote = await client.listAll()
-  console.log(`  ファイル ${remote.files.length} 件 / ディレクトリ ${remote.dirs.length} 件`)
+  console.log(`  ファイル ${remote.files.size} 件 / ディレクトリ ${remote.dirs.length} 件`)
 
   const plan = buildPlan(localFiles, remote)
+
+  console.log('書き込み対象を判定中 (サイズ比較 → バイト比較)...')
+  const { filesToWrite, skipped } = await selectFilesToWrite(client, localFiles, remote.files)
   console.log(
-    `計画: ディレクトリ削除 ${plan.dirsToDelete.length} / ファイル削除 ${plan.filesToDelete.length} / 書き込み ${localFiles.length}`,
+    `計画: ディレクトリ削除 ${plan.dirsToDelete.length} / ファイル削除 ${plan.filesToDelete.length} / 書き込み ${filesToWrite.length} (内容一致でスキップ ${skipped})`,
   )
 
   if (opts.dryRun) {
-    printDryRun(plan, localFiles)
+    printDryRun(plan, filesToWrite)
     return
   }
 
-  await executePlan(client, plan, localFiles)
+  await executePlan(client, plan, filesToWrite)
   console.log('同期完了')
 }
 
@@ -102,10 +105,43 @@ function buildPlan(localFiles, remote) {
 
   const dirsToDelete = minimizeDirs(remote.dirs.filter((d) => !localDirPaths.has(d)))
   const deletedDirSet = new Set(dirsToDelete)
-  const filesToDelete = remote.files.filter(
+  const filesToDelete = [...remote.files.keys()].filter(
     (f) => !localFilePaths.has(f) && !hasAncestorIn(f, deletedDirSet),
   )
   return { dirsToDelete, filesToDelete }
+}
+
+// ローカルとリモートの内容が一致するファイルは書き込み対象から外す。
+// 1) サイズが違えば書き込み 2) 同じなら両方の中身をバイト比較して判定。
+// Buffer は判定後に破棄し、実行時に再度ローカルから読み込む。
+async function selectFilesToWrite(client, localFiles, remoteFiles) {
+  const filesToWrite = []
+  let skipped = 0
+  for (const file of localFiles) {
+    const decision = await classifyFile(client, file, remoteFiles.get(file.relPath))
+    if (decision.write) {
+      filesToWrite.push({ ...file, reason: decision.reason })
+    } else {
+      skipped++
+    }
+  }
+  return { filesToWrite, skipped }
+}
+
+async function classifyFile(client, file, remoteMeta) {
+  if (!remoteMeta) return { write: true, reason: 'new' }
+
+  const { size: localSize } = await stat(file.absPath)
+  if (remoteMeta.sizeBytes !== localSize) {
+    return { write: true, reason: 'size-differs' }
+  }
+
+  const [localBytes, remoteBytes] = await Promise.all([
+    readFile(file.absPath),
+    client.readFile(file.relPath),
+  ])
+  if (localBytes.equals(remoteBytes)) return { write: false }
+  return { write: true, reason: 'content-differs' }
 }
 
 function collectAncestorDirs(relPaths) {
@@ -142,15 +178,15 @@ function hasAncestorIn(filePath, dirSet) {
   return false
 }
 
-function printDryRun(plan, localFiles) {
+function printDryRun(plan, filesToWrite) {
   for (const d of plan.dirsToDelete) console.log(`  rmdir ${d}`)
   for (const f of plan.filesToDelete) console.log(`  rm    ${f}`)
-  for (const f of localFiles) console.log(`  write ${f.relPath}`)
+  for (const f of filesToWrite) console.log(`  write ${f.relPath} (${f.reason})`)
 }
 
 // Dataform API はワークスペース変更系呼び出しの並列実行を拒否する
 // (409 ABORTED: sync mutate calls cannot be queued) ため直列で実行する
-async function executePlan(client, plan, localFiles) {
+async function executePlan(client, plan, filesToWrite) {
   for (const dir of plan.dirsToDelete) {
     console.log(`  rmdir ${dir}`)
     await client.removeDirectory(dir)
@@ -159,8 +195,8 @@ async function executePlan(client, plan, localFiles) {
     console.log(`  rm ${path}`)
     await client.removeFile(path)
   }
-  for (const file of localFiles) {
-    console.log(`  write ${file.relPath}`)
+  for (const file of filesToWrite) {
+    console.log(`  write ${file.relPath} (${file.reason})`)
     const contents = await readFile(file.absPath)
     await client.writeFile(file.relPath, contents)
   }

@@ -29,14 +29,16 @@ export class DataformClient {
   }
 
   async listAll() {
-    const files = []
+    const files = new Map()
     const dirs = []
     const pending = ['']
     while (pending.length > 0) {
       const dir = pending.shift()
       for await (const entry of this.#iterateDirectory(dir)) {
         if (typeof entry.file === 'string') {
-          files.push(entry.file)
+          const raw = entry.metadata?.sizeBytes
+          const sizeBytes = raw == null ? null : Number(raw)
+          files.set(entry.file, { sizeBytes })
         } else if (typeof entry.directory === 'string') {
           dirs.push(entry.directory)
           pending.push(entry.directory)
@@ -46,12 +48,20 @@ export class DataformClient {
     return { files, dirs }
   }
 
+  async readFile(path) {
+    const url = new URL(`${this.workspaceUrl}:readFile`)
+    url.searchParams.set('path', path)
+    const res = await this.#request('GET', url.toString())
+    return Buffer.from(res.fileContents ?? '', 'base64')
+  }
+
   async *#iterateDirectory(dir) {
     let pageToken
     do {
       const url = new URL(`${this.workspaceUrl}:queryDirectoryContents`)
       if (dir) url.searchParams.set('path', dir)
       url.searchParams.set('pageSize', '1000')
+      url.searchParams.set('view', 'DIRECTORY_CONTENTS_VIEW_METADATA')
       if (pageToken) url.searchParams.set('pageToken', pageToken)
       const res = await this.#request('GET', url.toString())
       for (const entry of res.directoryEntries ?? []) yield entry
