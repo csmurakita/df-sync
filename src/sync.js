@@ -9,7 +9,7 @@ import { runWithLimit } from './concurrency.js'
  * @typedef {(relPath: string, isDir: boolean) => boolean | Promise<boolean>} SkipPredicate
  *
  * sync が source / destination として扱う最小インターフェイス。
- * `localSide` (src/local.js) と `remoteSide` (src/api.js) が実装する。
+ * `localSide` / `remoteSide` (src/sides.js) が実装する。
  *
  * @typedef {Object} Side
  * @property {boolean} supportsRecursiveDirDelete - true なら removeDirectory が再帰的に削除する
@@ -45,17 +45,19 @@ export async function sync({ source, destination, mirror, dryRun, log = defaultL
     shouldSkipDelete: destination.shouldSkipDelete,
   })
 
+  const actions = buildActions(deletePlan, filesToWrite)
   log(
     `計画: ディレクトリ削除 ${deletePlan.dirs.length} / ファイル削除 ${deletePlan.files.length} / 書き込み ${filesToWrite.length} (スキップ ${skipped})`,
   )
 
-  if (dryRun) {
-    printDryRun(deletePlan, filesToWrite, log)
-    return
+  // Dataform API はワークスペース変更系呼び出しの並列実行を拒否する
+  // (409 ABORTED: sync mutate calls cannot be queued) ため直列で実行する。
+  // local destination でも直列を維持 (単純さのため)。
+  for (const action of actions) {
+    log(formatAction(action))
+    if (!dryRun) await applyAction(action, source, destination)
   }
-
-  await execute(destination, source, deletePlan, filesToWrite, log)
-  log('同期完了')
+  if (!dryRun) log('同期完了')
 }
 
 function defaultLog(...args) {
@@ -69,29 +71,28 @@ async function selectFilesToWrite(source, destination, src, dst) {
     CLASSIFY_CONCURRENCY,
     async ([relPath, srcMeta]) => {
       const decision = await classify(source, destination, relPath, srcMeta, dst.files.get(relPath))
-      if (!decision.write) return null
-      // content-differs 時の srcBytes は execute で書き込み時に使い回し、二重 read を避ける。
-      return { relPath, reason: decision.reason, bytes: decision.bytes }
+      // content-differs 時に decision.bytes を保持しておくことで execute の書き込みで
+      // source.read を 2 回発行するのを避ける。
+      return decision ? { relPath, ...decision } : null
     },
   )
   const filesToWrite = classified.filter(Boolean)
   return { filesToWrite, skipped: classified.length - filesToWrite.length }
 }
 
+// 書き込み不要なら null、書き込みが必要なら { reason, bytes? } を返す。
 async function classify(source, destination, relPath, srcMeta, dstMeta) {
-  if (!dstMeta) return { write: true, reason: 'new' }
+  if (!dstMeta) return { reason: 'new' }
   // sizeBytes は remote API が稀に欠落 (null) させる。両方 null の場合だけは
   // null !== null === false で size-differs に倒れず、後段のバイト比較に進む。
   // 片方だけ null なら不一致扱いで write させる (誤判定でもデータ損失より安全側)。
-  if (srcMeta.sizeBytes !== dstMeta.sizeBytes) {
-    return { write: true, reason: 'size-differs' }
-  }
+  if (srcMeta.sizeBytes !== dstMeta.sizeBytes) return { reason: 'size-differs' }
   const [srcBytes, dstBytes] = await Promise.all([
     source.read(relPath),
     destination.read(relPath),
   ])
-  if (srcBytes.equals(dstBytes)) return { write: false }
-  return { write: true, reason: 'content-differs', bytes: srcBytes }
+  if (srcBytes.equals(dstBytes)) return null
+  return { reason: 'content-differs', bytes: srcBytes }
 }
 
 // mirror が false なら削除対象は空。
@@ -109,14 +110,18 @@ async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSki
   let candidateDirs = dst.dirs.filter((d) => !srcAncestors.has(d))
 
   if (shouldSkipDelete) {
-    const fileSkips = await runWithLimit(candidateFiles, SKIP_DELETE_CONCURRENCY, (f) =>
-      shouldSkipDelete(f, false),
+    // files と dirs を 1 本の runWithLimit に束ねて、並列度 SKIP_DELETE_CONCURRENCY を
+    // 全削除候補で共有する (git check-ignore 呼び出しが 2 波に分かれるのを防ぐ)。
+    const items = [
+      ...candidateFiles.map((path) => ({ path, isDir: false })),
+      ...candidateDirs.map((path) => ({ path, isDir: true })),
+    ]
+    const skips = await runWithLimit(items, SKIP_DELETE_CONCURRENCY, ({ path, isDir }) =>
+      shouldSkipDelete(path, isDir),
     )
-    candidateFiles = candidateFiles.filter((_, i) => !fileSkips[i])
-    const dirSkips = await runWithLimit(candidateDirs, SKIP_DELETE_CONCURRENCY, (d) =>
-      shouldSkipDelete(d, true),
-    )
-    candidateDirs = candidateDirs.filter((_, i) => !dirSkips[i])
+    const kept = items.filter((_, i) => !skips[i])
+    candidateFiles = kept.filter((x) => !x.isDir).map((x) => x.path)
+    candidateDirs = kept.filter((x) => x.isDir).map((x) => x.path)
   }
 
   if (recursiveDirDelete) {
@@ -129,28 +134,40 @@ async function buildDeletePlan(src, dst, { mirror, recursiveDirDelete, shouldSki
   return { dirs: [], files: candidateFiles }
 }
 
-function printDryRun(plan, filesToWrite, log) {
-  for (const d of plan.dirs) log(`  rmdir ${d}`)
-  for (const f of plan.files) log(`  rm    ${f}`)
-  for (const f of filesToWrite) log(`  write ${f.relPath} (${f.reason})`)
+// deletePlan と filesToWrite を rmdir → rm → write の単一アクション列に整える。
+// dryRun / 本番のログ出力と実行はどちらもこの列を順に処理する。
+function buildActions(deletePlan, filesToWrite) {
+  const actions = []
+  for (const relPath of deletePlan.dirs) actions.push({ kind: 'rmdir', relPath })
+  for (const relPath of deletePlan.files) actions.push({ kind: 'rm', relPath })
+  for (const { relPath, reason, bytes } of filesToWrite) {
+    actions.push({ kind: 'write', relPath, reason, bytes })
+  }
+  return actions
 }
 
-// Dataform API はワークスペース変更系呼び出しの並列実行を拒否する
-// (409 ABORTED: sync mutate calls cannot be queued) ため直列で実行する。
-// local destination でも直列を維持 (単純さのため)。
-async function execute(destination, source, plan, filesToWrite, log) {
-  for (const dir of plan.dirs) {
-    log(`  rmdir ${dir}`)
-    await destination.removeDirectory(dir)
+function formatAction(action) {
+  switch (action.kind) {
+    case 'rmdir':
+      return `  rmdir ${action.relPath}`
+    case 'rm':
+      return `  rm    ${action.relPath}`
+    case 'write':
+      return `  write ${action.relPath} (${action.reason})`
   }
-  for (const path of plan.files) {
-    log(`  rm ${path}`)
-    await destination.removeFile(path)
-  }
-  for (const file of filesToWrite) {
-    log(`  write ${file.relPath} (${file.reason})`)
-    const bytes = file.bytes ?? (await source.read(file.relPath))
-    await destination.write(file.relPath, bytes)
+}
+
+async function applyAction(action, source, destination) {
+  switch (action.kind) {
+    case 'rmdir':
+      return destination.removeDirectory(action.relPath)
+    case 'rm':
+      return destination.removeFile(action.relPath)
+    case 'write': {
+      // classify が content-differs 時に読み込んだ bytes はここで使い回す (二重 read 回避)。
+      const bytes = action.bytes ?? (await source.read(action.relPath))
+      return destination.write(action.relPath, bytes)
+    }
   }
 }
 

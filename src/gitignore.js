@@ -41,29 +41,17 @@ async function createGitIgnorePredicate(root) {
     ['-C', root, 'check-ignore', '--stdin', '-z', '--verbose', '--non-matching', '--no-index'],
     { stdio: ['pipe', 'pipe', 'pipe'] },
   )
-  child.stdout.setEncoding('utf8')
   // stderr はパイプ詰まりを避けるため読み捨てる
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', () => {})
 
   const queue = []
-  let buffer = ''
-  let fields = []
-  child.stdout.on('data', (chunk) => {
-    buffer += chunk
-    let idx
-    while ((idx = buffer.indexOf('\0')) >= 0) {
-      fields.push(buffer.slice(0, idx))
-      buffer = buffer.slice(idx + 1)
-      if (fields.length === 4) {
-        // -z --non-matching 時、非一致は source フィールドが空文字
-        const matched = fields[0] !== ''
-        fields = []
-        const pending = queue.shift()
-        if (pending) pending.resolve(matched)
-      }
-    }
+  readNullRecords(child.stdout, 4, (fields) => {
+    // -z --non-matching 時、非一致は source フィールドが空文字
+    const matched = fields[0] !== ''
+    queue.shift()?.resolve(matched)
   })
+
   const fail = (err) => {
     while (queue.length) queue.shift().reject(err)
   }
@@ -89,6 +77,27 @@ async function createGitIgnorePredicate(root) {
     } catch {}
   }
   return predicate
+}
+
+// stream を NUL 区切りで読み、fieldsPerRecord 個まとまるごとに onRecord にフィールド配列を渡す。
+// チャンク境界で NUL が割れても繋ぎ直せるよう、buffer / fields は関数内部で保持する。
+function readNullRecords(stream, fieldsPerRecord, onRecord) {
+  stream.setEncoding('utf8')
+  let buffer = ''
+  let fields = []
+  stream.on('data', (chunk) => {
+    buffer += chunk
+    let idx
+    while ((idx = buffer.indexOf('\0')) >= 0) {
+      fields.push(buffer.slice(0, idx))
+      buffer = buffer.slice(idx + 1)
+      if (fields.length === fieldsPerRecord) {
+        const record = fields
+        fields = []
+        onRecord(record)
+      }
+    }
+  })
 }
 
 async function createFallbackPredicate(root) {

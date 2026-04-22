@@ -1,7 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { setTimeout as delay } from 'node:timers/promises'
 import { GoogleAuth } from 'google-auth-library'
-import { filterAlwaysExcluded } from './exclude.js'
 
 const API_ROOT = 'https://dataform.googleapis.com/v1'
 
@@ -187,30 +186,4 @@ function parseRetryAfter(value) {
   const dateMs = Date.parse(value)
   if (Number.isFinite(dateMs)) return Math.max(0, dateMs - Date.now())
   return null
-}
-
-// shouldSkipDelete: --mirror 削除時にスキップ判定する述語
-// (呼び出し側はローカルの完全 ignore を渡すことで、remote 側の
-// ローカル除外対象パスの削除を防げる)。
-/** @returns {import('./sync.js').Side} */
-export function remoteSide(client, { shouldSkipDelete = null } = {}) {
-  return {
-    supportsRecursiveDirDelete: true,
-    shouldSkipDelete,
-    async list() {
-      return filterAlwaysExcluded(await client.listAll())
-    },
-    async read(relPath) {
-      return client.readFile(relPath)
-    },
-    async write(relPath, bytes) {
-      return client.writeFile(relPath, bytes)
-    },
-    async removeFile(relPath) {
-      return client.removeFile(relPath)
-    },
-    async removeDirectory(relPath) {
-      return client.removeDirectory(relPath)
-    },
-  }
 }

@@ -1,5 +1,5 @@
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readdir, stat } from 'node:fs/promises'
+import { join } from 'node:path'
 import { createSemaphore } from './concurrency.js'
 import { isAlwaysExcludedName } from './exclude.js'
 
@@ -13,33 +13,6 @@ export async function enumerateLocal(root, isIgnored) {
   const sem = createSemaphore(FS_CONCURRENCY)
   await walk(root, '', isIgnored, files, dirs, sem)
   return { files, dirs }
-}
-
-// listFilter   : list() に適用する ignore 述語。null なら walk の ALWAYS_EXCLUDE のみ。
-// shouldSkipDelete: --mirror 削除時にスキップ判定する述語（完全な local ignore を想定）。
-/** @returns {import('./sync.js').Side} */
-export function localSide(root, { listFilter = null, shouldSkipDelete = null } = {}) {
-  return {
-    supportsRecursiveDirDelete: false,
-    shouldSkipDelete,
-    async list() {
-      return enumerateLocal(root, listFilter)
-    },
-    async read(relPath) {
-      return readFile(join(root, relPath))
-    },
-    async write(relPath, bytes) {
-      const abs = join(root, relPath)
-      await mkdir(dirname(abs), { recursive: true })
-      await writeFile(abs, bytes)
-    },
-    async removeFile(relPath) {
-      await unlink(join(root, relPath))
-    },
-    async removeDirectory() {
-      throw new Error('local destination に対するディレクトリ再帰削除はサポートされません')
-    },
-  }
 }
 
 // ディレクトリ直下のエントリ (isIgnored 判定 / stat / 子 walk) は Promise.all で並列に回す。
