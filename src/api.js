@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { GoogleAuth } from 'google-auth-library'
-import { matchesAlwaysExclude } from './local.js'
+import { filterAlwaysExcluded } from './exclude.js'
 
 const API_ROOT = 'https://dataform.googleapis.com/v1'
 
@@ -50,28 +50,37 @@ export class DataformClient {
   }
 
   async readFile(path) {
-    const url = new URL(`${this.workspaceUrl}:readFile`)
-    url.searchParams.set('path', path)
-    const res = await this.#request('GET', url.toString())
+    const res = await this.#request('GET', this.#url(':readFile', { path }))
     return Buffer.from(res.fileContents ?? '', 'base64')
   }
 
   async *#iterateDirectory(dir) {
     let pageToken
     do {
-      const url = new URL(`${this.workspaceUrl}:queryDirectoryContents`)
-      if (dir) url.searchParams.set('path', dir)
-      url.searchParams.set('pageSize', '1000')
-      url.searchParams.set('view', 'DIRECTORY_CONTENTS_VIEW_METADATA')
-      if (pageToken) url.searchParams.set('pageToken', pageToken)
-      const res = await this.#request('GET', url.toString())
+      const url = this.#url(':queryDirectoryContents', {
+        path: dir || undefined,
+        pageSize: '1000',
+        view: 'DIRECTORY_CONTENTS_VIEW_METADATA',
+        pageToken,
+      })
+      const res = await this.#request('GET', url)
       for (const entry of res.directoryEntries ?? []) yield entry
       pageToken = res.nextPageToken
     } while (pageToken)
   }
 
+  #url(suffix, params) {
+    const url = new URL(`${this.workspaceUrl}${suffix}`)
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== null) url.searchParams.set(k, v)
+      }
+    }
+    return url.toString()
+  }
+
   async #post(operation, body) {
-    return this.#request('POST', `${this.workspaceUrl}${operation}`, body)
+    return this.#request('POST', this.#url(operation), body)
   }
 
   async #request(method, url, body) {
@@ -109,13 +118,7 @@ export function remoteSide(client, { shouldSkipDelete = null } = {}) {
     supportsRecursiveDirDelete: true,
     shouldSkipDelete,
     async list() {
-      const { files, dirs } = await client.listAll()
-      const filteredFiles = new Map()
-      for (const [p, m] of files) {
-        if (!matchesAlwaysExclude(p)) filteredFiles.set(p, m)
-      }
-      const filteredDirs = dirs.filter((d) => !matchesAlwaysExclude(d))
-      return { files: filteredFiles, dirs: filteredDirs }
+      return filterAlwaysExcluded(await client.listAll())
     },
     async read(relPath) {
       return client.readFile(relPath)
