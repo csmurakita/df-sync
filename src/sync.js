@@ -47,7 +47,13 @@ export async function sync({ source, destination, mirror, dryRun, log = defaultL
   log(`  destination: ファイル ${dst.files.size} 件 / ディレクトリ ${dst.dirs.length} 件`)
 
   log('書き込み対象を判定中 (サイズ比較 → バイト比較)...')
-  const { filesToWrite, skipped } = await selectFilesToWrite(source, destination, src, dst)
+  const { filesToWrite, skippedMatch, skippedPreFilter } = await selectFilesToWrite(
+    source,
+    destination,
+    src,
+    dst,
+    { dryRun },
+  )
 
   const deletePlan = await buildDeletePlan(src, dst, {
     mirror,
@@ -56,8 +62,14 @@ export async function sync({ source, destination, mirror, dryRun, log = defaultL
   })
 
   const actions = buildActions(deletePlan, filesToWrite)
+  // 「内容一致でスキップ」と「shouldSkipWrite で前段除外」は意味が違うので分けて出す
+  // (後者は 0 のときはログに出さず、挙動変化がない場合のノイズを抑える)。
+  const skipLog =
+    skippedPreFilter > 0
+      ? `(スキップ 内容一致 ${skippedMatch} / 除外 ${skippedPreFilter})`
+      : `(スキップ ${skippedMatch})`
   log(
-    `計画: ディレクトリ削除 ${deletePlan.dirs.length} / ファイル削除 ${deletePlan.files.length} / 書き込み ${filesToWrite.length} (スキップ ${skipped})`,
+    `計画: ディレクトリ削除 ${deletePlan.dirs.length} / ファイル削除 ${deletePlan.files.length} / 書き込み ${filesToWrite.length} ${skipLog}`,
   )
 
   // Dataform API はワークスペース変更系呼び出しの並列実行を拒否する
@@ -104,23 +116,36 @@ function makeDestinationDescentSkip(src, destination, mirror) {
   }
 }
 
-async function selectFilesToWrite(source, destination, src, dst) {
+async function selectFilesToWrite(source, destination, src, dst, { dryRun }) {
   // destination が拒否するパス (download 側 local の ALWAYS_EXCLUDE 等) は
   // classify する前に落とす — 余計な source.read / destination.read を発行しない。
   const skipWrite = destination.shouldSkipWrite
-  const entries = skipWrite ? [...src.files].filter(([p]) => !skipWrite(p)) : [...src.files]
+  const entries = []
+  let skippedPreFilter = 0
+  for (const entry of src.files) {
+    if (skipWrite && skipWrite(entry[0])) skippedPreFilter++
+    else entries.push(entry)
+  }
   const classified = await runWithLimit(
     entries,
     CLASSIFY_CONCURRENCY,
     async ([relPath, srcMeta]) => {
       const decision = await classify(source, destination, relPath, srcMeta, dst.files.get(relPath))
+      if (!decision) return null
+      // dryRun 時は classify が読んだ bytes を捨てる (差分が多い大規模ツリーで
+      // filesToWrite[].bytes がヒープに滞留するのを避ける)。apply しないので使わない。
+      if (dryRun) return { relPath, reason: decision.reason }
       // content-differs 時に decision.bytes を保持しておくことで execute の書き込みで
       // source.read を 2 回発行するのを避ける。
-      return decision ? { relPath, ...decision } : null
+      return { relPath, ...decision }
     },
   )
   const filesToWrite = classified.filter(Boolean)
-  return { filesToWrite, skipped: classified.length - filesToWrite.length }
+  return {
+    filesToWrite,
+    skippedMatch: classified.length - filesToWrite.length,
+    skippedPreFilter,
+  }
 }
 
 // 書き込み不要なら null、書き込みが必要なら { reason, bytes? } を返す。
@@ -179,11 +204,15 @@ async function filterWithSkipDelete({ files, dirs }, shouldSkipDelete) {
   const skips = await runWithLimit(items, SKIP_DELETE_CONCURRENCY, ({ path, isDir }) =>
     shouldSkipDelete(path, isDir),
   )
-  const kept = items.filter((_, i) => !skips[i])
-  return {
-    files: kept.filter((x) => !x.isDir).map((x) => x.path),
-    dirs: kept.filter((x) => x.isDir).map((x) => x.path),
+  const keptFiles = []
+  const keptDirs = []
+  for (let i = 0; i < items.length; i++) {
+    if (skips[i]) continue
+    const { path, isDir } = items[i]
+    if (isDir) keptDirs.push(path)
+    else keptFiles.push(path)
   }
+  return { files: keptFiles, dirs: keptDirs }
 }
 
 // recursiveDirDelete=true の destination (remote) 向け: dir を rmdir 一発で消す前提で、

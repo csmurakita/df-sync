@@ -49,12 +49,25 @@ async function createGitIgnorePredicate(root) {
     ['-C', root, 'check-ignore', '--stdin', '-z', '--verbose', '--non-matching', '--no-index'],
     { stdio: ['pipe', 'pipe', 'pipe'] },
   )
-  // stderr はパイプ詰まりを避けるため読み捨てる
+  // stderr はパイプ詰まりを避けるため常時 drain しつつ末尾だけ保持しておく。
+  // fail 時の診断用。暴走出力で RAM を食わないよう上限でクランプする。
+  const STDERR_CAP = 4 * 1024
+  let stderrTail = ''
   child.stderr.setEncoding('utf8')
-  child.stderr.on('data', () => {})
+  child.stderr.on('data', (chunk) => {
+    stderrTail = (stderrTail + chunk).slice(-STDERR_CAP)
+  })
 
   const queue = []
-  const fail = (err) => {
+  const fail = (cause) => {
+    const tail = stderrTail.trim()
+    // stderr に有用な情報があるときだけ wrap する (無いときは元のエラーをそのまま流す)。
+    const err =
+      tail && cause instanceof Error
+        ? Object.assign(new Error(`${cause.message} (git check-ignore stderr: ${tail})`), {
+            cause,
+          })
+        : cause
     while (queue.length) queue.shift().reject(err)
   }
   readNullRecords(child.stdout, 4, (fields) => {

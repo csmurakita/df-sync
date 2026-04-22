@@ -44,8 +44,11 @@ export class DataformClient {
       const dir = pending.pop()
       for await (const entry of this.#iterateDirectory(dir)) {
         if (typeof entry.file === 'string') {
+          // sizeBytes は string / number / undefined いずれでも返り得る。
+          // 空文字や非数値は null に倒す (Number("") === 0 で本物の 0 バイトと衝突するのを防ぐ)。
           const raw = entry.metadata?.sizeBytes
-          const sizeBytes = raw == null ? null : Number(raw)
+          const num = raw == null || raw === '' ? NaN : Number(raw)
+          const sizeBytes = Number.isFinite(num) ? num : null
           files.set(entry.file, { sizeBytes })
         } else if (typeof entry.directory === 'string') {
           dirs.push(entry.directory)
